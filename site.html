@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="pt-pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Livraria Metanóia - Premium Store</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+        import { getFirestore, collection, addDoc, onSnapshot, deleteDoc, doc, updateDoc, query } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+
+        // CONFIGURAÇÃO DO FIREBASE
+        // Nota: O ambiente injeta __firebase_config e __app_id automaticamente.
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : {
+                apiKey: "AIzaSyCWRIc6qa0J63PyxofTFM33YU0CXjggA0w",
+                authDomain: "livraria-metanoia.firebaseapp.com",
+                projectId: "livraria-metanoia",
+                storageBucket: "livraria-metanoia.firebasestorage.app",
+                messagingSenderId: "571387146507",
+                appId: "1:571387146507:web:a5c041aed73c99eeaff20e"
+            };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+        
+        // ID da aplicação para persistência (Fixado para não perder dados entre sessões)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'metanoia-v1-persistent';
+
+        let state = {
+            books: [],
+            orders: [],
+            cart: [],
+            view: 'store',
+            adminTab: 'inventory',
+            user: null,
+            isAdmin: false,
+            isLoading: true,
+            editingBookId: null
+        };
+
+        // --- GESTÃO DE PERSISTÊNCIA (FIRESTORE) ---
+        
+        let activeUnsubscribers = [];
+
+        function clearSubscriptions() {
+            activeUnsubscribers.forEach(unsub => unsub());
+            activeUnsubscribers = [];
+        }
+
+        // Seguindo a REGRA 1: Caminhos estritos /artifacts/{appId}/public/data/{collection}
+        function subscribeToData(user) {
+            if (!user) return;
+            clearSubscriptions();
+
+            // 1. Livros (Dados Públicos)
+            const booksCol = collection(db, 'artifacts', appId, 'public', 'data', 'books');
+            const unsubBooks = onSnapshot(booksCol, 
+                (snapshot) => {
+                    state.books = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    render();
+                }, 
+                (error) => {
+                    console.error("Erro na persistência de livros:", error);
+                    if (error.code === 'permission-denied') {
+                        notify("Erro de permissão no Firestore", true);
+                    }
+                }
+            );
+            activeUnsubscribers.push(unsubBooks);
+
+            // 2. Pedidos (Apenas se for Admin / Utilizador autenticado)
+            if (!user.isAnonymous) {
+                const ordersCol = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+                const unsubOrders = onSnapshot(ordersCol, 
+                    (snapshot) => {
+                        state.orders = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
+                                        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+                        render();
+                    }, 
+                    (error) => console.error("Erro na persistência de vendas:", error)
+                );
+                activeUnsubscribers.push(unsubOrders);
+            }
+        }
+
+        async function initApp() {
+            // REGRA 3: Auth antes de Queries
+            onAuthStateChanged(auth, (user) => {
+                state.user = user;
+                state.isAdmin = user && !user.isAnonymous;
+                
+                if (user) {
+                    subscribeToData(user);
+                }
+                
+                state.isLoading = false;
+                render();
+            });
+
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else if (!auth.currentUser) {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Erro no Login Inicial:", err);
+                state.isLoading = false;
+                render();
+            }
+        }
+
+        // --- AÇÕES ---
+        window.loginAdmin = async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('login-email').value;
+            const pass = document.getElementById('login-pass').value;
+            try {
+                await signInWithEmailAndPassword(auth, email, pass);
+                document.getElementById('admin-login-modal').classList.add('hidden');
+                state.view = 'admin';
+                notify("Sessão Iniciada");
+            } catch (err) {
+                notify("Acesso Negado", true);
+            }
+        };
+
+        window.logout = async () => {
+            await signOut(auth);
+            await signInAnonymously(auth);
+            state.view = 'store';
+            notify("Sessão Terminada");
+        };
+
+        window.saveBook = async (e) => {
+            e.preventDefault();
+            if (!state.isAdmin || !state.user) return;
+            
+            const data = {
+                title: document.getElementById('f-title').value,
+                author: document.getElementById('f-author').value,
+                price: parseFloat(document.getElementById('f-price').value),
+                category: document.getElementById('f-category').value,
+                cover: document.getElementById('f-cover').value || "https://images.unsplash.com/photo-1544947950-fa07a98d237f?w=400",
+                description: document.getElementById('f-desc').value,
+                updatedAt: Date.now()
+            };
+
+            try {
+                const col = collection(db, 'artifacts', appId, 'public', 'data', 'books');
+                if (state.editingBookId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'books', state.editingBookId), data);
+                    notify("Obra Atualizada");
+                    state.editingBookId = null;
+                } else {
+                    data.createdAt = Date.now();
+                    await addDoc(col, data);
+                    notify("Obra Guardada na Nuvem");
+                }
+                e.target.reset();
+                render();
+            } catch (err) { 
+                notify("Erro ao gravar dados", true); 
+            }
+        };
+
+        window.checkout = async () => {
+            if (state.cart.length === 0 || !state.user) return;
+            const name = document.getElementById('c-name').value;
+            if (!name) return notify("Indique o seu nome", true);
+
+            const order = {
+                clientName: name,
+                items: state.cart.map(i => ({ title: i.title, price: i.price })),
+                total: state.cart.reduce((acc, i) => acc + i.price, 0),
+                createdAt: Date.now(),
+                status: 'Pendente'
+            };
+
+            try {
+                // REGRA 1: Caminho correto
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), order);
+                notify("Venda Registada!");
+                state.cart = [];
+                document.getElementById('cart-drawer').classList.add('hidden');
+                render();
+            } catch (err) { 
+                notify("Erro na finalização", true); 
+            }
+        };
+
+        // --- UI & RENDER ---
+        window.setView = (v) => { 
+            if (v === 'admin' && !state.isAdmin) {
+                document.getElementById('admin-login-modal').classList.remove('hidden');
+            } else {
+                state.view = v; 
+                render(); 
+            }
+        };
+        window.setAdminTab = (t) => { state.adminTab = t; render(); };
+        window.addToCart = (id) => {
+            const b = state.books.find(x => x.id === id);
+            if (b) { state.cart.push(b); notify("Adicionado ao carrinho"); render(); }
+        };
+        window.editBook = (id) => {
+            const b = state.books.find(x => x.id === id);
+            state.editingBookId = id;
+            state.adminTab = 'inventory';
+            render();
+            setTimeout(() => {
+                document.getElementById('f-title').value = b.title;
+                document.getElementById('f-author').value = b.author;
+                document.getElementById('f-price').value = b.price;
+                document.getElementById('f-category').value = b.category;
+                document.getElementById('f-cover').value = b.cover;
+                document.getElementById('f-desc').value = b.description;
+            }, 50);
+        };
+        window.deleteBook = async (id) => { 
+            if(confirm("Deseja apagar permanentemente este livro?")) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'books', id));
+            }
+        };
+        
+        function notify(msg, isErr = false) {
+            const t = document.getElementById('toast');
+            if (!t) return;
+            t.innerText = msg;
+            t.className = `fixed bottom-10 left-1/2 -translate-x-1/2 z-[999] px-8 py-4 rounded-full font-black uppercase text-[10px] tracking-widest shadow-2xl transition-all duration-500 ${isErr ? 'bg-red-600 text-white' : 'bg-[#e31e24] text-white opacity-100'}`;
+            setTimeout(() => t.classList.add('opacity-0'), 3000);
+        }
+
+        function render() {
+            const main = document.getElementById('app');
+            if (!main) return;
+            if (state.isLoading) {
+                main.innerHTML = `<div class="h-screen flex items-center justify-center bg-black"><div class="w-10 h-10 border-4 border-[#e31e24] border-t-transparent rounded-full animate-spin"></div></div>`;
+                return;
+            }
+            if (state.view === 'admin') renderAdmin(main); else renderStore(main);
+            updateCartUI();
+        }
+
+        function renderStore(el) {
+            el.innerHTML = `
+            <section class="h-[50vh] bg-black flex flex-col items-center justify-center relative border-b-4 border-[#e31e24]">
+                <div class="text-center z-10">
+                    <div class="w-24 h-24 bg-[#e31e24] rounded-2xl mx-auto mb-6 flex items-center justify-center shadow-[0_0_40px_rgba(227,30,36,0.4)]">
+                        <svg viewBox="0 0 24 24" fill="white" class="w-12 h-12"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                    </div>
+                    <h1 class="text-6xl font-black uppercase italic text-white tracking-tighter">Metanóia</h1>
+                    <p class="text-[#e31e24] font-bold tracking-[0.5em] uppercase text-[9px] mt-2">Curadoria de Conhecimento Permanente</p>
+                </div>
+            </section>
+            <div class="container mx-auto px-6 py-20">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-10">
+                    ${state.books.length > 0 ? state.books.map(b => `
+                        <div class="group bg-white rounded-[2rem] overflow-hidden shadow-xl hover:-translate-y-2 transition-all border border-gray-100 hover:border-[#e31e24]">
+                            <div class="h-80 overflow-hidden"><img src="${b.cover}" class="w-full h-full object-cover group-hover:scale-105 transition-transform"></div>
+                            <div class="p-6">
+                                <h3 class="font-black uppercase italic text-lg truncate">${b.title}</h3>
+                                <p class="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-4">${b.author}</p>
+                                <div class="flex justify-between items-center border-t pt-4">
+                                    <span class="text-xl font-black">${b.price.toFixed(2)}€</span>
+                                    <button onclick="addToCart('${b.id}')" class="bg-black text-white px-5 py-2 rounded-full text-[9px] font-black uppercase hover:bg-[#e31e24] transition">Comprar</button>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('') : `
+                        <div class="col-span-full text-center py-20">
+                            <p class="font-black uppercase text-gray-300 animate-pulse tracking-widest">A aceder à base de dados...</p>
+                            <p class="text-[10px] text-gray-400 mt-2 italic">Se esta mensagem persistir, verifique a ligação.</p>
+                        </div>
+                    `}
+                </div>
+            </div>`;
+        }
+
+        function renderAdmin(el) {
+            el.innerHTML = `
+            <div class="min-h-screen bg-[#0a0a0a] text-white p-8">
+                <div class="max-w-6xl mx-auto">
+                    <div class="flex justify-between items-center mb-12">
+                        <h2 class="text-3xl font-black uppercase italic text-[#e31e24]">Gestão</h2>
+                        <div class="flex gap-4">
+                            <button onclick="setView('store')" class="bg-white/5 px-6 py-2 rounded-full text-[9px] font-black uppercase">Sair do Painel</button>
+                            <button onclick="logout()" class="bg-red-600/20 text-red-500 px-6 py-2 rounded-full text-[9px] font-black uppercase">Terminar Sessão</button>
+                        </div>
+                    </div>
+                    <div class="flex gap-8 mb-10 border-b border-white/5">
+                        <button onclick="setAdminTab('inventory')" class="pb-4 text-[10px] font-black uppercase tracking-widest ${state.adminTab === 'inventory' ? 'text-white border-b-2 border-[#e31e24]' : 'text-gray-500'}">Inventário</button>
+                        <button onclick="setAdminTab('sales')" class="pb-4 text-[10px] font-black uppercase tracking-widest ${state.adminTab === 'sales' ? 'text-white border-b-2 border-[#e31e24]' : 'text-gray-500'}">Vendas na Nuvem</button>
+                    </div>
+
+                    ${state.adminTab === 'inventory' ? `
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-12">
+                            <form onsubmit="saveBook(event)" class="bg-[#111] p-8 rounded-[2rem] border border-white/5 space-y-4 h-fit sticky top-10">
+                                <h4 class="font-black uppercase text-[#e31e24] mb-4">${state.editingBookId ? 'Editar Registo' : 'Novo Registo'}</h4>
+                                <input id="f-title" placeholder="Título" required class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24]">
+                                <input id="f-author" placeholder="Autor" required class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24]">
+                                <input id="f-price" type="number" step="0.01" placeholder="Preço" required class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24]">
+                                <input id="f-category" placeholder="Categoria" required class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24]">
+                                <input id="f-cover" placeholder="URL Capa" class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24]">
+                                <textarea id="f-desc" placeholder="Sinopse" class="w-full bg-black border border-white/10 p-3 rounded-xl text-xs outline-none focus:border-[#e31e24] h-24"></textarea>
+                                <button type="submit" class="w-full py-4 bg-[#e31e24] text-white font-black uppercase text-[10px] rounded-xl hover:bg-white hover:text-black transition">Guardar Permanentemente</button>
+                            </form>
+                            <div class="lg:col-span-2 bg-[#111] rounded-[2rem] border border-white/5 overflow-hidden">
+                                <table class="w-full text-left text-[10px]">
+                                    <thead class="bg-white/5 uppercase font-black text-gray-500">
+                                        <tr><th class="p-4">Obra</th><th class="p-4">Preço</th><th class="p-4 text-right">Ações</th></tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-white/5">
+                                        ${state.books.map(b => `
+                                            <tr class="hover:bg-white/[0.02]">
+                                                <td class="p-4 flex items-center gap-3">
+                                                    <img src="${b.cover}" class="w-8 h-10 object-cover rounded shadow-lg">
+                                                    <div><p class="font-black uppercase italic">${b.title}</p><p class="text-gray-500">${b.author}</p></div>
+                                                </td>
+                                                <td class="p-4 font-black">${b.price.toFixed(2)}€</td>
+                                                <td class="p-4 text-right">
+                                                    <button onclick="editBook('${b.id}')" class="text-blue-400 mr-2 font-black uppercase">Editar</button>
+                                                    <button onclick="deleteBook('${b.id}')" class="text-red-500 font-black uppercase">Apagar</button>
+                                                </td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    ` : `
+                        <div class="space-y-4">
+                            ${state.orders.length ? state.orders.map(o => `
+                                <div class="bg-[#111] p-6 rounded-2xl border border-white/5 flex flex-col md:flex-row justify-between gap-4 items-center">
+                                    <div>
+                                        <div class="flex items-center gap-2 mb-2">
+                                            <span class="text-[8px] bg-green-600 px-2 py-0.5 rounded font-black uppercase text-white">Gravado</span>
+                                            <span class="text-[9px] text-gray-500 font-bold tracking-widest uppercase">${new Date(o.createdAt).toLocaleString()}</span>
+                                        </div>
+                                        <h3 class="text-lg font-black uppercase italic">${o.clientName}</h3>
+                                        <div class="text-[9px] text-gray-400 mt-2 uppercase font-bold tracking-widest">
+                                            ${o.items.map(i => `• ${i.title}`).join(' ')}
+                                        </div>
+                                    </div>
+                                    <div class="md:text-right">
+                                        <p class="text-2xl font-black text-[#e31e24] italic">${o.total.toFixed(2)}€</p>
+                                        <p class="text-[7px] text-gray-600 uppercase font-black mt-1">ID: ${o.id}</p>
+                                    </div>
+                                </div>
+                            `).join('') : '<p class="text-center py-20 text-gray-600 uppercase font-black tracking-widest italic">A aguardar sincronização de vendas...</p>'}
+                        </div>
+                    `}
+                </div>
+            </div>`;
+        }
+
+        function updateCartUI() {
+            const btn = document.getElementById('cart-btn-count');
+            const itemsEl = document.getElementById('cart-items-list');
+            const totalEl = document.getElementById('cart-total-price');
+            if (btn) btn.innerText = state.cart.length;
+            if (itemsEl) {
+                itemsEl.innerHTML = state.cart.length ? state.cart.map(i => `
+                    <div class="flex justify-between items-center py-2 border-b border-gray-100">
+                        <span class="text-[10px] font-bold uppercase truncate pr-4">${i.title}</span>
+                        <span class="text-[10px] font-black">${i.price.toFixed(2)}€</span>
+                    </div>`).join('') : '<p class="text-center text-gray-300 text-[9px] py-10 uppercase font-black">Carrinho Vazio</p>';
+                totalEl.innerText = state.cart.reduce((a, b) => a + b.price, 0).toFixed(2) + "€";
+            }
+        }
+
+        window.toggleCart = () => document.getElementById('cart-drawer').classList.toggle('hidden');
+        window.onload = initApp;
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; background: #fafafa; margin: 0; overflow-x: hidden; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #e31e24; border-radius: 10px; }
+    </style>
+</head>
+<body class="text-black">
+    <header class="bg-black text-white py-4 px-6 sticky top-0 z-50 border-b border-[#e31e24]/20">
+        <div class="container mx-auto flex justify-between items-center">
+            <div class="flex items-center gap-3 cursor-pointer" onclick="setView('store')">
+                <div class="w-8 h-8 bg-[#e31e24] rounded-lg flex items-center justify-center font-black">M</div>
+                <span class="font-black uppercase italic tracking-tighter text-lg">Metanóia</span>
+            </div>
+            <div class="flex items-center gap-6">
+                <button onclick="setView('admin')" class="text-[8px] font-black uppercase text-gray-400 hover:text-[#e31e24] transition-colors tracking-widest">Admin</button>
+                <button onclick="toggleCart()" class="relative bg-white/10 p-2 rounded-lg transition-transform active:scale-95">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>
+                    <span id="cart-btn-count" class="absolute -top-1 -right-1 bg-[#e31e24] text-[8px] w-4 h-4 rounded-full flex items-center justify-center font-black shadow-lg">0</span>
+                </button>
+            </div>
+        </div>
+    </header>
+    
+    <div id="app"></div>
+
+    <!-- MODAL DE LOGIN ADMIN -->
+    <div id="admin-login-modal" class="fixed inset-0 bg-black/95 backdrop-blur-md z-[200] hidden flex items-center justify-center p-4">
+        <div class="bg-white p-10 rounded-[2.5rem] w-full max-w-sm text-center shadow-2xl">
+            <h3 class="text-2xl font-black uppercase italic mb-8 tracking-tighter">Login na Nuvem</h3>
+            <form onsubmit="loginAdmin(event)" class="space-y-4">
+                <input id="login-email" type="email" placeholder="EMAIL" required class="w-full p-4 bg-gray-100 rounded-2xl outline-none focus:ring-2 ring-[#e31e24] text-xs font-bold transition-all">
+                <input id="login-pass" type="password" placeholder="PASSWORD" required class="w-full p-4 bg-gray-100 rounded-2xl outline-none focus:ring-2 ring-[#e31e24] text-xs font-bold transition-all">
+                <div class="flex gap-4 pt-4">
+                    <button type="button" onclick="document.getElementById('admin-login-modal').classList.add('hidden')" class="flex-1 text-[9px] font-black uppercase tracking-widest text-gray-400">Voltar</button>
+                    <button type="submit" class="flex-1 bg-[#e31e24] text-white py-4 rounded-2xl font-black uppercase text-[9px] tracking-widest hover:shadow-[0_0_20px_rgba(227,30,36,0.3)] transition-all">Autenticar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- DRAWER DO CARRINHO -->
+    <div id="cart-drawer" class="fixed inset-0 z-[150] hidden">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="toggleCart()"></div>
+        <div class="absolute right-0 top-0 h-full w-80 bg-white shadow-2xl p-8 flex flex-col transform transition-transform">
+            <h3 class="text-xl font-black uppercase italic mb-8 border-b-2 border-[#e31e24] pb-2 inline-block w-fit">Carrinho</h3>
+            <div id="cart-items-list" class="flex-1 overflow-y-auto"></div>
+            <div class="mt-auto border-t pt-6">
+                <div class="flex justify-between mb-4">
+                    <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Total Global</span>
+                    <span id="cart-total-price" class="text-2xl font-black italic text-[#e31e24]">0.00€</span>
+                </div>
+                <input id="c-name" placeholder="NOME DO CLIENTE" class="w-full p-3 bg-gray-100 rounded-xl text-[10px] font-bold mb-4 outline-none border border-transparent focus:border-[#e31e24] transition-all uppercase">
+                <button onclick="checkout()" class="w-full bg-black text-white py-4 rounded-xl font-black uppercase text-[10px] tracking-widest hover:bg-[#e31e24] transition-colors">Confirmar Venda</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="opacity-0 pointer-events-none transition-all duration-500 transform translate-y-10"></div>
+</body>
+</html>
